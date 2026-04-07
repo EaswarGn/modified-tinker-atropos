@@ -26,6 +26,9 @@ from tinker_atropos.types import (
     TokenLogprob,
 )
 from tinker_atropos.config import TinkerAtroposConfig
+import logging
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class TinkerAtroposTrainer:
@@ -693,56 +696,49 @@ async def chat_completions(request: ChatCompletionRequest):
 
 @app.post("/generate", response_model=GenerateResponse | List[GenerateResponse])
 async def generate(request: GenerateRequest):
-    """
-    /generate endpoint for ManagedServer.
-    Called by ManagedServer with tokenized input_ids.
-    Returns GenerateResponse for single completion (n=1) or List[GenerateResponse] for multiple (n>1).
-    """
     if trainer is None:
         raise HTTPException(status_code=503, detail="Trainer not initialized")
 
     try:
-        # Extract input_ids (ManagedServer sends tokenized input)
         if request.input_ids is None:
             raise HTTPException(status_code=400, detail="input_ids is required")
 
         prompt_tokens = request.input_ids
-
-        # Extract sampling params
         sampling_params = request.sampling_params or {}
         n = sampling_params.get("n", 1)
         max_tokens = sampling_params.get("max_new_tokens", 256)
-        temperature = sampling_params.get("temperature", 1.0)
-        stop = sampling_params.get("stop", [])
-        
-        
-        # Generate using Tinker sampling client
+
         model_input = ModelInput.from_ints(prompt_tokens)
         tinker_sampling_params = SamplingParams(
             max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop if isinstance(stop, list) else [stop],
+            temperature=sampling_params.get("temperature", 1.0),
+            stop=sampling_params.get("stop", []),
         )
 
+        start = time.time()
         result = await trainer.current_sampling_client.sample_async(
             prompt=model_input,
             sampling_params=tinker_sampling_params,
             num_samples=n,
         )
-        print(result)
+        end = time.time()
+        generation_time = round(end-start, 2)
 
-        if n == 1:
-            sequence = result.sequences[0]
+        # --- Process Results & Collect Stats ---
+        response_list = []
+        total_completion_tokens = 0
+
+        for sequence in result.sequences:
             output_tokens = sequence.tokens
-            output_logprobs = sequence.logprobs if sequence.logprobs else []
+            total_completion_tokens += len(output_tokens)
+            
             output_text = trainer.tokenizer.decode(output_tokens, skip_special_tokens=True)
+            output_token_logprobs = [
+                (logprob, tid, trainer.tokenizer.decode([tid]))
+                for tid, logprob in zip(output_tokens, sequence.logprobs or [])
+            ]
 
-            output_token_logprobs = []
-            for token_id, logprob in zip(output_tokens, output_logprobs):
-                token_text = trainer.tokenizer.decode([token_id])
-                output_token_logprobs.append((logprob, token_id, token_text))
-
-            return GenerateResponse(
+            response_list.append(GenerateResponse(
                 text=output_text,
                 meta_info={
                     "prompt_tokens": len(prompt_tokens),
@@ -750,36 +746,22 @@ async def generate(request: GenerateRequest):
                     "finish_reason": "stop",
                     "output_token_logprobs": output_token_logprobs,
                 },
-            )
-        else:
-            # Multiple completions - return list of GenerateResponse objects
-            results = []
-            for sequence in result.sequences:
-                output_tokens = sequence.tokens
-                output_logprobs = sequence.logprobs if sequence.logprobs else []
-                output_text = trainer.tokenizer.decode(output_tokens, skip_special_tokens=True)
+            ))
 
-                # Format logprobs for response
-                output_token_logprobs = []
-                for token_id, logprob in zip(output_tokens, output_logprobs):
-                    token_text = trainer.tokenizer.decode([token_id])
-                    output_token_logprobs.append((logprob, token_id, token_text))
+        # --- Logging the Stats ---
+        avg_tokens = total_completion_tokens / n
+        logger.info(
+            f"GENERATE STATS | n={n} | "
+            f"Generation time: {generation_time} |"
+            f"Prompt: {len(prompt_tokens)} tokens | "
+            f"Total Completion: {total_completion_tokens} tokens | "
+            f"Avg: {avg_tokens:.1f} tokens/sample |"
+        )
 
-                results.append(
-                    GenerateResponse(
-                        text=output_text,
-                        meta_info={
-                            "prompt_tokens": len(prompt_tokens),
-                            "completion_tokens": len(output_tokens),
-                            "finish_reason": "stop",
-                            "output_token_logprobs": output_token_logprobs,
-                        },
-                    )
-                )
-
-            return results
+        return response_list[0] if n == 1 else response_list
 
     except Exception as e:
+        logger.error(f"Generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 
@@ -842,8 +824,42 @@ async def logprobs(request: LogprobsRequest):
 def run_fastapi_server():
     """Run FastAPI server in background thread."""
     import uvicorn
+    
+    LOGGING_CONFIG = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            },
+        },
+        "handlers": {
+            "file": {
+                "class": "logging.FileHandler",
+                "filename": "server_logs.log",
+                "formatter": "default",
+            },
+        },
+        "loggers": {
+            "uvicorn": {
+                "handlers": ["file"], 
+                "level": "INFO", 
+                "propagate": False
+            },
+            "uvicorn.error": {
+                "handlers": ["file"], 
+                "level": "INFO", 
+                "propagate": False
+            },
+            "uvicorn.access": {
+                "handlers": ["file"], 
+                "level": "INFO", 
+                "propagate": False
+            },
+        },
+    }
 
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info", log_config=LOGGING_CONFIG)
 
 
 async def main():
