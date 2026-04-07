@@ -723,8 +723,6 @@ async def generate(request: GenerateRequest):
             temperature=temperature,
             stop=stop if isinstance(stop, list) else [stop],
         )
-        
-        print("generating using tinker sampling client")
 
         result = await trainer.current_sampling_client.sample_async(
             prompt=model_input,
